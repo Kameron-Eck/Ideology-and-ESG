@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+from pathlib import Path
+import logging
+import re
+from typing import List
+
+import duckdb
+import pandas as pd
+from nameparser import HumanName
+from splink import DuckDBAPI, Linker, SettingsCreator, block_on
+import splink.comparison_library as cl
+
+# ---------------------------------------------------------------------------#
+# Configuration
+# ---------------------------------------------------------------------------#
+
+DATA_FILE      = Path(r"D:\Data\execucomp2024.txt")
+TEMP_DIR       = Path(r"D:\Data\temp")        # for DuckDB spill files
+MATCH_THRESHOLD = 0.99                        # probability threshold for a match
+RANDOM_MAX_PAIRS = 10_000_000                 # pairs used to estimate u‑probability
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+
+# ---------------------------------------------------------------------------#
+# Utilities
+# ---------------------------------------------------------------------------#
+
+
+def load_data(path: Path) -> pd.DataFrame:
+    """Load ExecuComp data and perform baseline cleaning."""
+    df = pd.read_csv(
+        path,
+        sep="\t",
+        na_values=["nan", "NaN", "NaT", "None", "#N/A", "null"],
+        keep_default_na=False,
+    )
+    df.columns = df.columns.str.lower()
+    df = df.apply(lambda c: c.str.lower() if c.dtype == "object" else c)
+    df["unique_id"] = df.index + 1
+    df["cusip"] = df["cusip"].str.lstrip("0")
+    logging.info("Loaded %s rows from %s", len(df), path)
+    return df
+
+
+def extract_suffix(col: pd.Series) -> pd.Series:
+    """Grab and clean the suffix part of 'dirname'."""
+    suffix = col.str.split(",", n=1).str[1].str.strip()
+    suffix = (
+        suffix.str.replace(r"\([^)]*\)", "", regex=True)   # balanced ()
+        .str.replace(r"\([^)]*", "", regex=True)           # unbalanced (
+        .str.replace(r"[^)]*\)", "", regex=True)           # unbalanced )
+        .str.replace("[.,]", "", regex=True)
+        .str.strip()
+        .str.lower()
+    )
+    return suffix
+
+
+def remove_titles(col: pd.Series) -> pd.Series:
+    """Remove honorific titles from a name whilst preserving spacing."""
+    def _clean(n: str) -> str:
+        hn = HumanName(n)
+        body = f"{hn.first} {hn.middle} {hn.last}".strip()
+        return re.sub(r"\s+", " ", body)
+
+    return col.apply(_clean)
+
+
+def engineer_name_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Create arrays, title, last name, and organised name columns."""
+    df["title"] = df["dirname"].apply(lambda n: HumanName(n).title)
+    df["dirname"] = remove_titles(df["dirname"])
+    df["dirname"] = df["dirname"].str.replace(r"[^a-z0-9\s]", "", regex=True)
+    df["last"] = df["dirname"].str.split().str[-1]
+
+    df["dirname_array"] = df["dirname"].str.split()
+    df["suffix_array"] = df["suffix"].str.split()
+    df["dirname_organized"] = df["dirname"].apply(
+        lambda x: " ".join(sorted(x.split())) if isinstance(x, str) else x
+    )
+    return df
+
+
+def reorder_columns(df: pd.DataFrame, first_cols: List[str]) -> pd.DataFrame:
+    others = [c for c in df.columns if c not in first_cols]
+    return df[first_cols + others]
+
+
+# ---------------------------------------------------------------------------#
+# Splink model helpers
+# ---------------------------------------------------------------------------#
+
+
+def create_linker(df: pd.DataFrame, temp_dir: Path) -> Linker:
+    """Build a Splink linker with pre‑defined comparisons and blocking."""
+    duck_con = duckdb.connect()
+    duck_con.execute(f"PRAGMA temp_directory='{temp_dir}'")
+
+    settings = SettingsCreator(
+        link_type="dedupe_only",
+        blocking_rules_to_generate_predictions=[
+            block_on("gvkey", "last", "suffix"),
+            block_on("gvkey", "last"),
+            block_on("gvkey", "dirname"),
+        ],
+        comparisons=[
+            cl.ArrayIntersectAtSizes("dirname_array", [4, 3, 2]),
+            cl.ExactMatch("last"),
+            cl.ExactMatch("title"),
+            cl.JaroWinklerAtThresholds("dirname", [0.95, 0.9]),
+            cl.ArrayIntersectAtSizes("suffix_array", [2, 1]),
+        ],
+    )
+
+    return Linker([df], settings, db_api=DuckDBAPI(connection=duck_con))
+
+
+def train_model(linker: Linker) -> None:
+    """Estimate parameters for the Splink model."""
+    linker.training.estimate_u_using_random_sampling(max_pairs=RANDOM_MAX_PAIRS)
+
+    for rule in [
+        block_on("last", "exchange"),
+        block_on("gvkey"),
+        block_on("dirname", "title"),
+    ]:
+        linker.training.estimate_parameters_using_expectation_maximisation(
+            rule, estimate_without_term_frequencies=True
+        )
+
+
+def predict_clusters(linker: Linker) -> pd.DataFrame:
+    """Run inference and clustering; return a frame id → cluster_id."""
+    pred = linker.inference.predict(threshold_match_probability=MATCH_THRESHOLD)
+    clusters = linker.clustering.cluster_pairwise_predictions_at_threshold(
+        pred, threshold_match_probability=MATCH_THRESHOLD
+    )
+    return clusters.as_pandas_dataframe().rename(columns={"cluster_id": "company_person_id"})
+
+
+# ---------------------------------------------------------------------------#
+# Main workflow
+# ---------------------------------------------------------------------------#
+
+
+def main() -> None:
+    df = load_data(DATA_FILE)
+
+    # Feature engineering
+    df["suffix"] = extract_suffix(df["dirname"])
+    df["dirname"] = df["dirname"].str.split(",", n=1).str[0].str.strip()
+    df = engineer_name_features(df)
+
+    # Deduplicate with Splink
+    linker = create_linker(df, TEMP_DIR)
+    train_model(linker)
+    cluster_df = predict_clusters(linker)
+
+    # Merge cluster IDs back
+    df = df.merge(cluster_df[["unique_id", "company_person_id"]], on="unique_id", how="left")
+
+    # Re‑order for readability
+    first_cols = [
+        "unique_id",
+        "company_person_id",
+        "coname",
+        "cusip",
+        "gvkey",
+        "ticker",
+        "exchange",
+        "year",
+        "dirname",
+        "title",
+        "suffix",
+        "last",
+        "dirname_array",
+        "suffix_array",
+        "dirname_organized",
+    ]
+    df = reorder_columns(df, first_cols)
+
+    # Persist or pass df onward
+    df.to_parquet(DATA_FILE.with_suffix(".parquet"))
+    logging.info("Finished. Output saved to %s", DATA_FILE.with_suffix(".parquet"))
+
+
+if __name__ == "__main__":
+    main()
